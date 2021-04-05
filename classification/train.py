@@ -30,23 +30,41 @@ def get_tranforms(train=True):
         ])
 
 
-def get_loader(train=True):
+def get_loader(args):
     dataset = torchvision.datasets.CIFAR10(root='./data',
-                                           train=train,
+                                           train=True,
                                            download=True,
-                                           transform=get_tranforms(train))
-    loader = torch.utils.data.DataLoader(dataset,
-                                         batch_size=128,
-                                         shuffle=True if train else False,
-                                         num_workers=2)
+                                           transform=get_tranforms(True))
+    dataset_val = torchvision.datasets.CIFAR10(root='./data',
+                                               train=False,
+                                               download=True,
+                                               transform=get_tranforms(False))
+    if distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset)
+        val_sampler = torch.utils.data.DistributedSampler(dataset_val)
+    else:
+        train_sampler = torch.utils.data.RandomSampler(dataset)
+        val_sampler = torch.utils.data.SequentialSampler(dataset_val)
 
-    return loader
+    data_loader_train = torch.utils.data.DataLoader(dataset,
+                                                    batch_size=args.batch_size,
+                                                    sampler=train_sampler,
+                                                    num_workers=args.workers,
+                                                    pin_memory=True)
+
+    data_loader_val = torch.utils.data.DataLoader(dataset_val,
+                                                  batch_size=args.batch_size,
+                                                  sampler=val_sampler,
+                                                  num_workers=args.workers,
+                                                  pin_memory=True)
+
+    return data_loader_train, data_loader_val
 
 
 def train_one_epoch(model,
                     criterion,
                     optimizer,
-                    lr_scheduler,
                     data_loader,
                     device,
                     epoch,
@@ -58,6 +76,7 @@ def train_one_epoch(model,
         'lr', utils.SmoothedValue(window_size=1, fmt='{value:.5f}'))
     metric_logger.add_meter(
         'img/s', utils.SmoothedValue(window_size=10, fmt='{value:.2f}'))
+
     header = f'Epoch: [{epoch}]'
     for image, target in metric_logger.log_every(data_loader, print_freq,
                                                  header):
@@ -70,8 +89,6 @@ def train_one_epoch(model,
 
         loss.backward()
         optimizer.step()
-
-        lr_scheduler.step()
 
         acc1 = utils.accuracy(output, target, topk=(1, ))
         batch_size = image.shape[0]
@@ -110,25 +127,86 @@ def evaluate(model, criterion, data_loader, device, print_freq=100):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default='resnet18', help='model')
+    parser.add_argument('--device', default='cuda', help='device')
+    parser.add_argument('-b', '--batch-size', default=32, type=int)
+    parser.add_argument('--max-epochs',
+                        default=100,
+                        type=int,
+                        metavar='N',
+                        help='number of total epochs to run')
+    parser.add_argument('-j',
+                        '--workers',
+                        default=16,
+                        type=int,
+                        metavar='N',
+                        help='number of data loading workers (default: 16)')
+    parser.add_argument('--lr',
+                        default=0.1,
+                        type=float,
+                        help='initial learning rate')
+    parser.add_argument('--momentum',
+                        default=0.9,
+                        type=float,
+                        metavar='M',
+                        help='momentum')
+    parser.add_argument('--wd',
+                        '--weight-decay',
+                        default=1e-4,
+                        type=float,
+                        metavar='W',
+                        help='weight decay (default: 1e-4)',
+                        dest='weight_decay')
+
+    parser.add_argument('--print-freq',
+                        default=10,
+                        type=int,
+                        help='print frequency')
+    parser.add_argument('--output-dir', default='.', help='path where to save')
+    parser.add_argument('--resume', default='', help='resume from checkpoint')
+    parser.add_argument('--start-epoch',
+                        default=0,
+                        type=int,
+                        metavar='N',
+                        help='start epoch')
+
+    parser.add_argument("--test-only",
+                        dest="test_only",
+                        help="Only test the model",
+                        action="store_true")
+
+    # distributed training parameters
+    parser.add_argument('--world-size',
+                        default=1,
+                        type=int,
+                        help='number of distributed processes')
+    parser.add_argument('--dist-url',
+                        default='env://',
+                        help='url used to set up distributed training')
 
     args = parser.parse_args()
 
     return args
 
 
-def main():
+def main(args):
     MAX_EPOCHS = 100
     LR = 0.1
     SWA = False
     SWA_START = 80
 
+    device = torch.device(args.device)
+
     # dataset
-    train_loader = get_loader(train=True)
-    val_loader = get_loader(train=False)
+    data_loader_train, data_loader_valid = get_loader(args)
 
     # model
     model = torchvision.models.resnet18()
-    model.cuda()
+    model.to(device)
+
+    # sync batchnorm
+    if args.distributed:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(model.parameters(),
                           lr=LR,
@@ -136,6 +214,23 @@ def main():
                           weight_decay=5e-4)
     lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer,
                                                         T_max=MAX_EPOCHS)
+
+    if args.distributed:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[args.gpus])
+        model_without_ddp = model.module
+
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location='cpu')
+        model_without_ddp.load_state_dict(checkpoint['model'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+        args.start_epoch = checkpoint['epoch'] + 1
+
+    if args.test_only:
+        evaluate(model, criterion, val_loader, device=device)
+        return
+
     if SWA:
         swa_cfg = {
             'swa_model': optim.swa_utils.AveragedModel(model),
@@ -145,7 +240,10 @@ def main():
     else:
         swa_cfg = None
 
-    for epoch in range(MAX_EPOCHS):
+    # Start training
+    for epoch in range(args.start_epoch, args.max_epochs):
+        if args.distributed:
+            train_sampler.set_epoch(epoch)
         train_one_epoch(model, criterion, optimizer, lr_scheduler,
                         train_loader, 'cuda', epoch + 1, 50, swa_cfg)
         evaluate(model, criterion, val_loader, 'cuda', print_freq=20)
@@ -155,4 +253,5 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    args = parse_args()
+    main(args)
