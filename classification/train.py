@@ -1,7 +1,10 @@
 import os
+import os.path as osp
 import argparse
 import time
+import random
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -10,66 +13,44 @@ import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as T
 
+import timm
+
+import models
 import utils
 
 
 def get_tranforms(train=True):
     if train:
         return T.Compose([
-            T.RandomCrop(32, padding=4),
             T.RandomHorizontalFlip(),
+            T.RandomCrop(32, padding=4),
             T.ToTensor(),
-            T.Normalize(mean=(0.4914, 0.4822, 0.4465),
-                        std=(0.2023, 0.1994, 0.2010))
+            T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
         ])
     else:
         return T.Compose([
             T.ToTensor(),
-            T.Normalize(mean=(0.4914, 0.4822, 0.4465),
-                        std=(0.2023, 0.1994, 0.2010))
+            T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
         ])
 
 
-def get_loader(args):
-    dataset = torchvision.datasets.CIFAR10(root='./data',
-                                           train=True,
-                                           download=True,
-                                           transform=get_tranforms(True))
-    dataset_val = torchvision.datasets.CIFAR10(root='./data',
-                                               train=False,
-                                               download=True,
-                                               transform=get_tranforms(False))
-    if distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(
-            dataset)
-        val_sampler = torch.utils.data.DistributedSampler(dataset_val)
-    else:
-        train_sampler = torch.utils.data.RandomSampler(dataset)
-        val_sampler = torch.utils.data.SequentialSampler(dataset_val)
+def get_data(args):
+    dataset = torchvision.datasets.CIFAR100(root='./data',
+                                            train=True,
+                                            download=True,
+                                            transform=get_tranforms(True))
+    dataset_val = torchvision.datasets.CIFAR100(root='./data',
+                                                train=False,
+                                                download=True,
+                                                transform=get_tranforms(False))
+    train_sampler = torch.utils.data.RandomSampler(dataset)
+    val_sampler = torch.utils.data.SequentialSampler(dataset_val)
 
-    data_loader_train = torch.utils.data.DataLoader(dataset,
-                                                    batch_size=args.batch_size,
-                                                    sampler=train_sampler,
-                                                    num_workers=args.workers,
-                                                    pin_memory=True)
-
-    data_loader_val = torch.utils.data.DataLoader(dataset_val,
-                                                  batch_size=args.batch_size,
-                                                  sampler=val_sampler,
-                                                  num_workers=args.workers,
-                                                  pin_memory=True)
-
-    return data_loader_train, data_loader_val
+    return dataset, dataset_val, train_sampler, val_sampler
 
 
-def train_one_epoch(model,
-                    criterion,
-                    optimizer,
-                    data_loader,
-                    device,
-                    epoch,
-                    print_freq,
-                    swa_cfg=None):
+def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch,
+                    print_freq):
     model.train()
     metric_logger = utils.MetricLogger(delimiter=', ')
     metric_logger.add_meter(
@@ -124,19 +105,38 @@ def evaluate(model, criterion, data_loader, device, print_freq=100):
     return metric_logger.acc1.global_avg
 
 
+def set_random_seed(seed, deterministic=False):
+    """Set random seed.
+    
+    Args:
+        seed (int): Seed to be used.
+        deterministic (bool): Whether to set the deterministic option for
+            CUDNN backend, i.e., set `torch.backends.cudnn.deterministic`
+            to True and `torch.backends.cudnn.benchmark` to False.
+            Default: False.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, default='resnet18', help='model')
+    parser.add_argument('--model', type=str, default='resnet18d', help='model')
     parser.add_argument('--device', default='cuda', help='device')
-    parser.add_argument('-b', '--batch-size', default=32, type=int)
-    parser.add_argument('--max-epochs',
-                        default=100,
+    parser.add_argument('-b', '--batch-size', default=128, type=int)
+    parser.add_argument('--epochs',
+                        default=200,
                         type=int,
                         metavar='N',
                         help='number of total epochs to run')
     parser.add_argument('-j',
                         '--workers',
-                        default=16,
+                        default=4,
                         type=int,
                         metavar='N',
                         help='number of data loading workers (default: 16)')
@@ -156,9 +156,41 @@ def parse_args():
                         metavar='W',
                         help='weight decay (default: 1e-4)',
                         dest='weight_decay')
-
+    # SWA
+    parser.add_argument('--swa',
+                        action='store_true',
+                        help='swa usage flag (default: off)')
+    parser.add_argument('--swa_start',
+                        type=float,
+                        default=160,
+                        metavar='N',
+                        help='SWA start epoch number (default: 161)')
+    parser.add_argument('--swa_lr',
+                        type=float,
+                        default=0.05,
+                        metavar='LR',
+                        help='SWA LR (default: 0.05)')
+    parser.add_argument(
+        '--swa_c_epochs',
+        type=int,
+        default=1,
+        metavar='N',
+        help=
+        'SWA model collection frequency/cycle length in epochs (default: 1)')
+    parser.add_argument('--swa_on_cpu',
+                        action='store_true',
+                        help='store swa model on cpu flag (default: off)')
+    #
+    parser.add_argument('--eval-interval',
+                        default=5,
+                        type=int,
+                        help='evaluate interval')
+    parser.add_argument('--save-interval',
+                        default=25,
+                        type=int,
+                        help='checkpoint interval')
     parser.add_argument('--print-freq',
-                        default=10,
+                        default=100,
                         type=int,
                         help='print frequency')
     parser.add_argument('--output-dir', default='.', help='path where to save')
@@ -168,20 +200,16 @@ def parse_args():
                         type=int,
                         metavar='N',
                         help='start epoch')
-
     parser.add_argument("--test-only",
                         dest="test_only",
                         help="Only test the model",
                         action="store_true")
 
-    # distributed training parameters
-    parser.add_argument('--world-size',
-                        default=1,
+    parser.add_argument('--seed',
                         type=int,
-                        help='number of distributed processes')
-    parser.add_argument('--dist-url',
-                        default='env://',
-                        help='url used to set up distributed training')
+                        default=42,
+                        metavar='S',
+                        help='random seed (default: 42)')
 
     args = parser.parse_args()
 
@@ -189,69 +217,98 @@ def parse_args():
 
 
 def main(args):
-    MAX_EPOCHS = 100
-    LR = 0.1
-    SWA = False
-    SWA_START = 80
+
+    set_random_seed(args.seed)
 
     device = torch.device(args.device)
 
     # dataset
-    data_loader_train, data_loader_valid = get_loader(args)
+    dataset, dataset_val, train_sampler, val_sampler = get_data(args)
+    data_loader_train = torch.utils.data.DataLoader(dataset,
+                                                    batch_size=args.batch_size,
+                                                    shuffle=True,
+                                                    num_workers=args.workers,
+                                                    pin_memory=True)
+    data_loader_val = torch.utils.data.DataLoader(dataset_val,
+                                                  batch_size=args.batch_size,
+                                                  shuffle=False,
+                                                  num_workers=args.workers,
+                                                  pin_memory=True)
 
     # model
-    model = torchvision.models.resnet18()
+    # model = timm.create_model(args.model, num_classes=100)
+    model_cfg = getattr(models, args.model)
+    model = model_cfg.base(*model_cfg.args,
+                           num_classes=100,
+                           **model_cfg.kwargs)
     model.to(device)
-
-    # sync batchnorm
-    if args.distributed:
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(model.parameters(),
-                          lr=LR,
-                          momentum=0.9,
-                          weight_decay=5e-4)
+                          lr=args.lr,
+                          momentum=args.momentum,
+                          weight_decay=args.weight_decay)
     lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer,
-                                                        T_max=MAX_EPOCHS)
+                                                        T_max=args.epochs)
 
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[args.gpus])
-        model_without_ddp = model.module
+    if args.swa:
+        swa_model = optim.swa_utils.AveragedModel(model)
+        swa_scheduler = optim.swa_utils.SWALR(optimizer, swa_lr=args.swa_lr)
 
     if args.resume:
-        ckpt = torch.load(args.resume, map_location='cpu')
-        model_without_ddp.load_state_dict(checkpoint['model'])
+        checkpoint = torch.load(args.resume, map_location='cpu')
+        model.load_state_dict(checkpoint['model'])
         optimizer.load_state_dict(checkpoint['optimizer'])
         lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
         args.start_epoch = checkpoint['epoch'] + 1
+        if args.swa:
+            swa_model.load_state_dict(checkpoint['swa_model'])
 
     if args.test_only:
-        evaluate(model, criterion, val_loader, device=device)
+        evaluate(model, criterion, data_loader_val, device=device)
         return
 
-    if SWA:
-        swa_cfg = {
-            'swa_model': optim.swa_utils.AveragedModel(model),
-            'swa_start': SWA_START,
-            'swa_scheduler': optim.swa_utils.SWALR(optimizer, swa_lr=0.01)
-        }
-    else:
-        swa_cfg = None
-
     # Start training
-    for epoch in range(args.start_epoch, args.max_epochs):
-        if args.distributed:
-            train_sampler.set_epoch(epoch)
-        train_one_epoch(model, criterion, optimizer, lr_scheduler,
-                        train_loader, 'cuda', epoch + 1, 50, swa_cfg)
-        evaluate(model, criterion, val_loader, 'cuda', print_freq=20)
+    for epoch in range(args.start_epoch, args.epochs):
+        train_one_epoch(model, criterion, optimizer, data_loader_train, device,
+                        epoch + 1, args.print_freq)
 
-    if SWA:
-        optim.swa_utils.update_bn(train_loader, swa_cfg['swa_model'])
+        if args.swa and (epoch + 1) > args.swa_start:
+            swa_scheduler.step()
+        else:
+            lr_scheduler.step()
+
+        if args.swa and (epoch + 1) > args.swa_start and (
+                epoch + 1 - args.swa_start) % args.swa_c_epochs == 0:
+            swa_model.update_parameters(model)
+
+            if not (epoch +
+                    1) % args.eval_interval or epoch == args.epochs - 1:
+                optim.swa_utils.update_bn(data_loader_train, swa_model, device)
+                print('SWA eval')
+                evaluate(swa_model,
+                         criterion,
+                         data_loader_val,
+                         device,
+                         print_freq=50)
+
+        if not (epoch + 1) % args.eval_interval:
+            evaluate(model, criterion, data_loader_val, device, print_freq=50)
+
+        if args.output_dir and (epoch + 1) % args.save_interval == 0:
+            checkpoint = {
+                'model': model.state_dict(),
+                'swa_model': swa_model.state_dict() if args.swa else None,
+                'optimizer': optimizer.state_dict(),
+                'lr_scheduler': lr_scheduler.state_dict(),
+                'epoch': epoch,
+                'args': args
+            }
+            torch.save(checkpoint,
+                       osp.join(args.output_dir, f'model_{epoch+1}.pth'))
 
 
 if __name__ == '__main__':
     args = parse_args()
+    print(args)
     main(args)
