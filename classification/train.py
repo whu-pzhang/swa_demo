@@ -272,6 +272,8 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         train_one_epoch(model, criterion, optimizer, data_loader_train, device,
                         epoch + 1, args.print_freq)
+        if not (epoch + 1) % args.eval_interval:
+            evaluate(model, criterion, data_loader_val, device, print_freq=50)
 
         if args.swa and (epoch + 1) > args.swa_start:
             swa_scheduler.step()
@@ -291,9 +293,6 @@ def main(args):
                          data_loader_val,
                          device,
                          print_freq=50)
-
-        if not (epoch + 1) % args.eval_interval:
-            evaluate(model, criterion, data_loader_val, device, print_freq=50)
 
         if args.output_dir and (epoch + 1) % args.save_interval == 0:
             checkpoint = {
