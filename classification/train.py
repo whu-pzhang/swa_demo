@@ -13,7 +13,6 @@ import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as T
 
-import timm
 
 import models
 import utils
@@ -160,24 +159,24 @@ def parse_args():
     parser.add_argument('--swa',
                         action='store_true',
                         help='swa usage flag (default: off)')
-    parser.add_argument('--swa_start',
+    parser.add_argument('--swa-start',
                         type=float,
                         default=160,
                         metavar='N',
                         help='SWA start epoch number (default: 161)')
-    parser.add_argument('--swa_lr',
+    parser.add_argument('--swa-lr',
                         type=float,
                         default=0.05,
                         metavar='LR',
                         help='SWA LR (default: 0.05)')
     parser.add_argument(
-        '--swa_c_epochs',
+        '--swa-c-epochs',
         type=int,
         default=1,
         metavar='N',
         help=
         'SWA model collection frequency/cycle length in epochs (default: 1)')
-    parser.add_argument('--swa_on_cpu',
+    parser.add_argument('--swa-on-cpu',
                         action='store_true',
                         help='store swa model on cpu flag (default: off)')
     #
@@ -217,7 +216,7 @@ def parse_args():
 
 
 def main(args):
-
+    utils.mkdir(args.output_dir)
     set_random_seed(args.seed)
 
     device = torch.device(args.device)
@@ -237,10 +236,11 @@ def main(args):
 
     # model
     # model = timm.create_model(args.model, num_classes=100)
-    model_cfg = getattr(models, args.model)
-    model = model_cfg.base(*model_cfg.args,
-                           num_classes=100,
-                           **model_cfg.kwargs)
+    # model_cfg = getattr(models, args.model)
+    # model = model_cfg.base(*model_cfg.args,
+    #                        num_classes=100,
+    #                        **model_cfg.kwargs)
+    model = models.__dict__[args.model](num_classes=100)
     model.to(device)
 
     criterion = nn.CrossEntropyLoss()
