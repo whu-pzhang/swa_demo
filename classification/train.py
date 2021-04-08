@@ -13,7 +13,6 @@ import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as T
 
-
 import models
 import utils
 
@@ -54,8 +53,6 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch,
     metric_logger = utils.MetricLogger(delimiter=', ')
     metric_logger.add_meter(
         'lr', utils.SmoothedValue(window_size=1, fmt='{value:.5f}'))
-    metric_logger.add_meter(
-        'img/s', utils.SmoothedValue(window_size=10, fmt='{value:.2f}'))
 
     header = f'Epoch: [{epoch}]'
     for image, target in metric_logger.log_every(data_loader, print_freq,
@@ -66,7 +63,6 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch,
         loss = criterion(output, target)
 
         optimizer.zero_grad()
-
         loss.backward()
         optimizer.step()
 
@@ -75,8 +71,6 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch,
         metric_logger.update(loss=loss.item(),
                              lr=optimizer.param_groups[0]["lr"])
         metric_logger.meters['acc1'].update(acc1[0], n=batch_size)
-        metric_logger.meters['img/s'].update(batch_size /
-                                             (time.time() - start_time))
 
 
 def evaluate(model, criterion, data_loader, device, print_freq=100):
@@ -86,8 +80,8 @@ def evaluate(model, criterion, data_loader, device, print_freq=100):
     with torch.no_grad():
         for image, target in metric_logger.log_every(data_loader, print_freq,
                                                      header):
-            image = image.to(device, non_blocking=True)
-            target = target.to(device, non_blocking=True)
+            image = image.to(device)
+            target = target.to(device)
             output = model(image)
             loss = criterion(output, target)
 
@@ -272,6 +266,7 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         train_one_epoch(model, criterion, optimizer, data_loader_train, device,
                         epoch + 1, args.print_freq)
+
         if not (epoch + 1) % args.eval_interval:
             evaluate(model, criterion, data_loader_val, device, print_freq=50)
 
