@@ -260,6 +260,9 @@ def main(args):
 
     if args.test_only:
         evaluate(model, criterion, data_loader_val, device=device)
+        if args.swa:
+            print('SWA eval')
+            evaluate(swa_model, criterion, data_loader_val, device=device)
         return
 
     # Start training
